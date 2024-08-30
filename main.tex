@@ -1,0 +1,351 @@
+\documentclass{article}
+\usepackage[utf8]{inputenc}
+\usepackage{hyperref}
+\usepackage{xurl}
+\usepackage[nottoc]{tocbibind}
+
+\usepackage{amsthm}
+\theoremstyle{definition}
+\newtheorem*{example}{Example}
+
+\title{Monero output lock analysis}
+\author{Cypher Stack\thanks{\url{https://cypherstack.com}} \and \texttt{Isthmus}}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+This report examines the implications of output lock times in the Monero protocol.
+As with any such report, it may contain errors and cannot guarantee correctness or security.
+Further, it cannot guarantee that any particular implementation or design is correct, secure, or suitable for intended use cases.
+
+The author asserts no warranty and disclaims liability for its use.
+The author further expresses no endorsement of any kind.
+This report has not undergone any further formal or peer review.
+
+
+\tableofcontents
+
+
+\section{Introduction}
+
+Monero transactions, like those of other digital asset protocols, consume existing \textit{outputs} representing value, and generate new outputs.
+Newly-generated outputs are constructed using a one-time verification key derivation that effectively transfers spend authority to the intended recipient.
+Transactions are authorized using signatures made with each consumed output's signing key.
+
+To protect the transaction graph mapping consumed outputs to generated outputs, each signature is actually a \textit{ring signature} that signs on behalf of a specified set of verification key without revealing the actual signer.
+In order to prevent double spending, signatures are \textit{linkable} and reveal a \textit{linking tag}.
+Successful verification of a signature with its corresponding linking tag asserts that the tag was generated honestly; if the tag has not been seen before in any previous valid transaction known to a verifier, no double spend has taken place.
+
+Transactions are organized into \textit{blocks} that are added to the \textit{chain}.
+Each block also contains a special \textit{coinbase} transaction that adds new value to the system.
+Such a transaction does not consume existing outputs, but generates coinbase outputs.
+These outputs reward block producers (\textit{miners}) for the computational work required to add a block to the chain; the amount of this reward includes a protocol-enforced value, as well as fees paid by other transactions in the block.
+
+For clarity, we refer to outputs generated in coinbase transactions as \textit{coinbase outputs}, and all generated outputs in other transactions as \textit{standard outputs}.
+
+The Monero protocol\footnote{\url{https://github.com/UkoeHB/Monero-RCT-report/blob/master/Zero-to-Monero-2-0-0.pdf}} enforces a lock on all generated outputs.
+Specifically, it is intended to prevent coinbase outputs from being spent until 60 blocks have passed since the block in which such an output appears, and to prevent standard outputs from being spent until 10 blocks have passed.
+
+In this technical note, we examine the enforcement of Monero output locks.
+Because the nature of locks can have implications on Monero usability and user security, we focus on these aspects specifically.
+
+Contributing researchers and developers are finalizing a proposed updated Monero protocol\footnote{\url{https://github.com/kayabaNerve/fcmp-ringct/blob/develop/fcmp\%2B\%2B.pdf}} that replaces ring signatures with a new construction, \textit{full-chain membership proofs (FCMPs)}.
+These proofs use Merkle trees to assert that an output consumed in a transaction with a specified linking tag has a verification key that exists in a set containing the verification keys from all existing unlocked outputs on the chain.
+In contrast, Monero ring signature verification key sets contain a protocol-specified number of keys (selected by the sender) that is currently set to 16.
+We investigate the implications of these proofs on output lock enforcement.
+
+
+\section{Context}
+
+In most other protocols where consumed outputs are definitively identifiable in transactions, this is easy to enforce: network participants simply reject any transaction consuming a locked output.
+However, this is not handled identically in protocols like Monero, since network participants cannot (without external information) determine which output a transaction consumes.
+Instead, network participants must reject any transaction containing a ring signature whose verification key set contains the key for a locked output.
+
+
+\subsection{Reorganizations}
+
+The primary motivation for output locks in blockchain-based digital asset protocols is to avoid the effects of chain reorganization.
+Monero (like many other digital asset protocols) uses a form of Nakamoto consensus, where the addition of a block to the chain requires at least a minimum amount of computational work that is enforced through nonce-based hashing verification.
+In the presence of multiple valid chains, network participants select the chain with the most cumulative work.
+When participants switch from one valid chain to another due to this rule, a \textit{reorganization} has occurred from one \textit{fork} of the chain to another.
+The ``abandoned'' fork is sometimes called the \textit{shorter} fork, and the selected fork the \textit{longer} fork; this is a casual but accepted misuse of terminology, since the number of blocks and amount of cumulative work need not strictly correlate.
+
+Any transaction that does not appear on the longest fork known to a network participant will not be judged as valid.
+
+The likelihood of a reorganization decreases over time, depending on the work requirement for new blocks that is specified by consensus rules.
+Most protocols employing Nakamoto consensus vary the minimum work threshold for block production to account for fluctuations in network computational power; this tuning can help to statistically enforce a steady block production rate over time.
+For example, the threshold in the Bitcoin protocol is changed every 2016 blocks to target a 10-minute window between produced blocks.
+The threshold in the Monero protocol is dynamically changed to target a two-minute window.
+
+Reorganizations may occur either honestly or maliciously.
+
+An honest reorganization can occur when multiple miners generate and distribute new valid blocks at nearly the same time; as these blocks propagate through the network, different network participants are likely to receive them inconsistently for a short time.
+Such participants eventually learn of the longest chain and switch to it, causing a reorganization.
+
+A malicious reorganization can occur\footnote{See, \textit{e.g.}, \url{https://arxiv.org/pdf/1311.0243} and \url{https://eprint.iacr.org/2015/796.pdf}} when a miner generates new valid blocks, but withholds them; or otherwise gains sufficient computational power to produce a fork with sufficient cumulative work.
+When it releases its blocks, participants switch to this longer fork, causing a reorganization.
+
+Reorganizations can also be affected by network fragmentation and topology.
+Idealized representations of networks are often assumed to have well-connected peers.
+However, if some network participants' connections to peers are insufficient, the overall network may be effectively segmented, or at least have subcomponents with minimal interconnectivity.
+This can result in significant delay for block propagation, which can in turn exacerbate the effects of reorganizations.
+Fragmentation itself can be honest if some participants simply lack broad peer connectivity, or malicious if connectivity is controlled or restricted by an adversary with authority over network access.
+
+Significant reorganizations have been observed in the Monero network\footnote{\url{https://github.com/noncesense-research-lab/archival_network/blob/master/analyses/altchain_temporal_study.ipynb}}, but with the caveat that they occurred prior to a change to the proof-of-work algorithm that altered the mining landscape in favor of more distributed computation.
+A later report\footnote{\url{https://github.com/monero-project/research-lab/issues/102\#issuecomment-1577827259}} observes a large number of two-block reorganizations and only four reorganizations of three blocks.
+
+
+\subsection{Confirmations}
+
+In order to mitigate the effects of reorganizations, it is common for wallet software to differentiate incoming transactions from \textit{confirmed} transactions.
+The wallet considers funds directed to it in transactions to be confirmed after a given number of blocks (a number of \textit{confirmations}) have subsequently been added to the chain, and usually will prohibit them from being spent until this occurs.
+This allows the wallet to provide some manner of confidence to the user that a reorganization, while possible, is unlikely to render the transaction invalid.
+
+Interestingly, it is even possible to provide additional granularity.
+Transactions are broadcast through the network to reach miners in order to be included in blocks.
+In the interval between broadcast and block distribution, network participants learn of the transaction.
+The wallet software used by the recipient of a transaction can examine these transactions and, if desired, inform the user of the existence of this transaction before it appears in any block.
+This is risky; depending on the volume of such pending transactions, it may be some time before the transaction is included in a block.
+It may also be the case that a reorganization renders the pending transaction invalid, at which point it will be discarded.
+A malicious sender could also issue a subsequent transaction spending the same funds, which may render the original pending transaction invalid for inclusion in a block; this depends on the actions of block producers.
+
+It is also folklore that for certain types of transactions, it may suffice for a recipient to impose a confirmation requirement that is nonzero, but that is less than recommendations.
+For example, a caf\'{e} may not wish to require that its customers wait for several confirmations before delivering a low-cost cup of coffee.
+(The author would certainly think twice before ordering coffee on a busy day if it meant waiting twenty minutes after paying!)
+While such a transaction may be invalidated due to reorganization, the merchant may judge this as an acceptable risk to keep operations flowing more smoothly.
+
+Conversely, some entities may require a larger number of confirmations for transactions that are of high value or otherwise judged to be subject to increased risk.
+Such an entity might be an exchange or a retailer of high-priced goods or services.
+For these transactions, the additional waiting time may be judged an acceptable consequence relative to the risk of reorganization.
+
+The idea of wallet software requiring a certain number of confirmations to consider funds confirmed need not coincide with a given protocol's output lock enforcement rules.
+
+\begin{example}
+The Bitcoin protocol enforces a lock for coinbase outputs, but does not enforce a lock for standard outputs (although senders may specify one optionally).
+However, it is common for Bitcoin wallet software to consider funds confirmed after 6 blocks have elapsed.
+Because the target Bitcoin block time is 10 minutes, this means funds are considered confirmed after approximately one hour.
+\end{example}
+
+\begin{example}
+The Monero protocol previously enforced a lock for coinbase outputs, but did not enforce a lock for standard outputs (although senders could specify one optionally).
+However, it was common for Monero wallet software to consider funds confirmed after 10 blocks had elapsed.
+Because the target Monero block time was 2 minutes, this meant funds were considered confirmed after approximately 20 minutes.
+\end{example}
+
+As noted earlier, the Monero protocol currently enforces a lock for coinbase outputs of 60 blocks, and a lock for standard outputs of 10 blocks.
+Wallet software still typically considers transactions confirmed after this 10-block period for standard outputs, so client behavior and protocol enforcement now can coincide.
+
+
+\section{Risks}
+
+We now examine specific risks associated to reorganization and related transaction validity.
+
+
+\subsection{Transaction invalidation}
+
+The nature of reorganization-induced transaction invalidation differs between protocols, and depends on output type.
+
+In the case of a transparent-graph protocol like Bitcoin, transactions that consume (and therefore generate) only standard outputs do not inherently rely on a particular chain fork for their validity.
+This is because such transactions directly identify the outputs they consume, and do not explicitly reference the context of the chain on which they appear.
+Such a transaction that is included in a shorter fork may be subsequently included in a reorganized longer fork without reissuance by the sender, provided that it consumes unspent outputs on that fork.
+However, transactions that rely on outputs generated after a reorganization fork point may be invalidated on the longer fork.
+On the other hand, a transaction consuming coinbase outputs generated after a reorganization fork point are inherently invalidated due to differing blocks on either side of the fork producing coinbase outputs.
+
+In the case of a protocol protecting its transaction graph, the invalidation case is more challenging.
+Unlike Bitcoin-type protocols, the Monero protocol does not directly identify output keys contained in rings.
+Instead, it references them using offsets, such that each key's position in the blockchain is provided with respect to the previous.
+This is essentially done for two reasons.
+
+First, the size of such a representation must scale linearly with the number of such keys contained in a ring (and, by extension, the number of such rings appearing in a transaction in the multi-input case); each key's full representation is 32 bytes, which would significantly bloat transactions.
+By using offsets, variable-length encoding provides for significantly shorter representations that are unambiguous with respect to a given chain view.
+
+Second, network participants must fetch referenced output key data from a local database in order to use them in signature verification.
+It can be significantly more efficient to fetch such keys using offsets than through another representation, especially since auxiliary information for each key is also required for verification that is not included directly in the transaction.
+
+This use of offsets is inherently tied to a particular chain view.
+If a valid transaction appears in a shorter fork but not a longer one, it is unlikely to be valid with respect to the longer fork; this is because it is unlikely that all referenced output keys have matching offsets on both sides of the fork.
+This is exacerbated since default output selection biases newer outputs in order to match expected spend patterns.
+
+
+\subsection{Double spending}
+
+A major risk of reorganizations is double spending or denial of service.
+
+To see the denial of service risk, suppose that a transaction appears on the shorter fork of a reorganization, but not on the longer fork.
+If the recipient in such a transaction has already provided a good or service to the sender, the recipient loses its funds after the reorganization.
+While this may occur honestly, the sender may also have arranged for this to take place in a malicious case; in either case, the recipient is denied funds.
+
+To see the double spend risk, suppose that a sender arranges to spend the same funds on two forks in a distinct manner.
+That is, the same output is consumed in both transactions, but with a different recipient or context.
+The recipient of funds on any shorter fork during a reorganization will lose the funds, while the sender has received value from each transaction.
+
+
+
+\subsection{User security}
+
+For protocols where the relationship between consumed and generated outputs in transactions is known, the security implications of reorganization may be minimal.
+However, for protocols like Monero where this relationship is ideally unknown, the situation is different.
+
+Overall, an important aspect of user security during reorganization relates to the linking of transactions across both sides of a fork.
+If an adversary monitoring the network can see transactions and blocks on both the shorter and longer fork during a reorganization, it can attempt to use transaction data and metadata to infer connections between ``equivalent'' transactions.
+
+In the case where a protocol and particular chain conditions are such that a given transaction is valid across both sides of a fork, there is minimal risk to the user.
+If a block producer includes the transaction on the longer side of the fork without the need for reissuance by the sender, there is effectively no information leakage.
+
+However, if it does not, and the transaction must be reissued for any reason, there is the potential for information leakage.
+For example, a reissued transaction might consume different inputs than the original, but contain the same outputs, allowing the adversary to trivially link them.
+Even if the reissued transaction uses different inputs and outputs (and does not otherwise contain linkable data), an adversary with sufficient insight into network topology may be able to examine transaction propagation to infer a link.
+
+In the case of Monero, there is additional risk associated from ring member sampling.
+This sampling is (almost) entirely outside the scope of consensus rules, with the current exception of lock enforcement.
+Indeed, it has evolved with wallet software and protocol versions in order to account for heuristics\footnote{See, \textit{e.g.}, \url{https://arxiv.org/abs/1704.04299}} involving transaction origin and expected spend time distributions.
+The complexity of this selection can lead to errors that leak information for transactions.
+
+
+\section{Protocol upgrade}
+
+A proposed future Monero protocol upgrade adds full-chain membership proofs, which replace ring signatures.
+These FCMPs use a zero-knowledge Merkle tree construction to assert that a given output verification key exists in such a tree, and allows for reasoning about it elsewhere in the protocol to assert honest linking tag construction and spend authority for transactions.
+
+In such a protocol, network participants update the Merkle tree each block, adding newly-generated standard output verification keys to it for use in future transactions.
+Coinbase outputs may be added to the tree later if required by a custom lock enforcement schedule.
+
+When a sender wishes to issue a transaction, it must select a block.
+This block's Merkle tree is used for the transaction's FCMPs.
+Importantly, these FCMPs bind strongly to the selected tree based on its root hash, and are invalid against any other tree.
+
+\begin{example}
+It is instructive to examine how this selection is handled elsewhere, as it has an effect on chain reorganization.
+The most well-known digital asset protocols with this kind of design are the Zcash protocols: these include Sapling and Orchard, both of which use zero-knowledge Merkle proofs in a manner akin to FCMPs in the proposed Monero protocol.
+
+In the Zcash protocols, senders choose a previous block for use in proof generation; these protocols call this the \textit{anchor} for the associated transaction.
+There are few network consensus rules governing the age of this anchor; it must be at least one and at most 100 blocks old.
+\end{example}
+
+Any restrictions to anchor selection, or to when outputs are added to Merkle trees, effectively enforce output locks.
+
+There are risks inherent with an anchor selection.
+
+If the anchor age is either not enforced or laxly enforced to a broad range, different wallet software might use different strategies or deterministic methods for the selection.
+This can produce a method of fingerprinting transactions to the wallet software used, which can provide useful information to an adversary.
+
+It is also the case that any network observer can reduce the effective set of possible signing keys in a transaction using the anchor age, since any outputs produced after the selected anchor block cannot be signers in a transaction by definition (they do not yet exist in the Merkle tree).
+This also provides a method for an adversary to attempt to pinpoint the age of a transaction if it was produced earlier than when it was issued to the network.
+
+Aside from fingerprinting and metadata leakage, reorganizations are particularly impactful in this design model.
+In the event of a reorganization, any transactions selecting anchor blocks that exist only on a shorter fork will always be rendered invalid after reorganization to a longer fork, since the anchor Merkle root will differ.
+This further means that future transactions relying on such invalidated transactions will themselves be rendered invalid.
+Should invalidation occur, senders must reissue their transactions using a valid anchor.
+
+When an invalidated transaction is reissued, it will reveal the same linking tags as the original transaction.
+This provides an adversary with information that deterministically links the two.
+Differences in transaction semantics may be relevant.
+
+
+\subsection{Proof decoupling}
+
+As noted, an adversary may be able to fingerprint when a transaction was produced in the event that it differs from when it was issued to the network.
+If the transaction's selected anchor is notably older than would be expected from default behavior, the adversary can infer the production time.
+
+This observation also means that if a protocol establishes a tight bound on anchor ages, transaction delay becomes more challenging.
+This can affect use cases of interest, such as those involving offline transaction production.
+
+Fortunately, some protocol designs decouple FCMPs from the underlying transaction semantics.
+This means that a sender can authorize a transaction given components like recipient details and specific consumed outputs, but not construct associated FCMPs.
+When it is time to issue the transaction to the network, the sender (or its delegate) produces the required FCMPs.
+
+This approach has several benefits.
+First, it helps to mitigate fingerprinting by masking the difference in production and issuance times.
+Further, it can enable the use of computationally-restricted signers that may be unable to produce FCMPs on their own, as is common for standalone hardware wallets.
+
+However, if not implemented carefully, it may be possible for a malicious sender delegate to construct the FCMPs suboptimally in a manner that could retain unwanted fingerprinting.
+Such details depend on the protocol, and are out of scope here.
+
+
+\subsection{Confirmation decoupling}
+
+We observe that standard outputs may be effectively divided into two groups for a given recipient:
+\begin{itemize}
+\item outputs sent to the recipient from itself
+\item outputs sent to the recipient from another user
+\end{itemize}
+The former occurs naturally when a transaction requires so-called \textit{change} that results when the value of generated outputs (and any fees) in a transaction does not perfectly match that of consumed outputs.
+
+This observation is important since the risks associated to reorganization-induced transaction invalidation and double spending do not apply to the self-directed case in the same manner.
+Indeed, if the recipient considers change to be confirmed in a transaction that is rendered invalidated by reorganization, the funds are effectively returned to itself.
+While this would require that any change-producing transaction also involving another user would need to be reissued, there is no risk of fund loss.
+
+\begin{example}
+In the case of Zcash, protocol developers recommend\footnote{\url{https://zips.z.cash/zip-0315}} that two time windows be considered for confirmation.
+For outputs sent to a user from itself, the window is three blocks.
+For outputs sent from another user, the windows is 10 blocks.
+
+It is further recommended that wallets select an anchor that is precisely three blocks old, based on the sender's current view of the chain at the time of transaction production.
+\end{example}
+
+This means that it is possible to effectively standard output confirmation from anchor-based lock enforcement in a manner that generally retains safety properties.
+
+We note that this reasoning could be inferred to mean that wallets may select the most recent block as an anchor.
+While this does not impose safety concerns, it is not done for usability reasons.
+Because short reorganizations are common, doing so would render many transactions invalid and require reissuance.
+
+
+\section{Options}
+
+Based on this analysis, we now issue options for consideration to the Monero protocol regarding output locking.
+Because of the significant differences in implication and risk between the current protocol and the proposed FCMP-based protocol, we present these options separately.
+
+
+\subsection{Current protocol}
+
+As shown, there are nontrivial risks present if output locks are not enforced in the current Monero protocol.
+Transaction invalidation is likely to occur during reorganization, and depending on how reissuance is handled by wallet software, signer protection may be reduced or eliminated entirely for such reissuance.
+This further reduces signer protection for other unrelated transactions via chain reaction analysis.
+
+It can be challenging to obtain comprehensive reorganization data, since reorganizations do not appear on chain and can vary significantly between network participants based on connectivity and propagation.
+Given that current known data seem to indicate only small reorganizations of at most two to three blocks over a period of several years, we consider that the current enforced restriction of 10 blocks (for standard outputs) to be conservative, though extremely safe.
+
+Should there be a strong desire to adjust the current network-enforced lock times prior to a more comprehensive protocol upgrade, we consider the following reasonable, given suitable empirical research:
+\begin{itemize}
+\item Obtain more comprehensive data on the extent of current chain reorganizations throughout the Monero network, focusing particularly on any known geographic distributions of network participants that affect subcomponent connectivity.
+\item Given that more extensive reorganizations are not observed, reduce the enforced lock for standard outputs to no fewer than six blocks.
+\item Ensure that wallet software considers standard outputs to be confirmed no sooner than six blocks.
+\item Ensure that wallet software, to the extent feasible, duplicates ring member sampling and transaction semantics in the event of a reorganization-induced transaction reissuance.
+\end{itemize}
+
+We caution, however, that a reduction in the lock enforcement period changes economic incentives for malicious block producers.
+Such a reduction therefore increases risk in a manner that is challenging to quantify.
+For this reason, careful ongoing observation of changes in block propagation, known mining distribution, estimated mining hash rate, and reorganization behavior are recommended if this option is implemented. 
+
+
+\subsection{FCMP-based protocol}
+
+As shown, there still exist risks if outputs locks are not enforced in a future FCMP-based protocol.
+Specifically, transaction invalidation will occur on reorganization due to the use of anchors tied to Merkle roots.
+However, signer protection is almost entirely maintained in the event that an invalidated transaction is reissued after reorganization occurs.
+This is because wallet software no longer needs to sample ring members where overlap between signatures is important.
+
+Given suitable empirical research, we consider the following reasonable for such a protocol:
+\begin{itemize}
+\item Obtain more comprehensive data on the extent of current chain reorganizations throughout the Monero network, focusing particularly on any known geographic distributions of network participants that affect subcomponent connectivity.
+\item Given that more extensive reorganizations are not observed, set an enforced minimum anchor depth initially at no fewer than three blocks.\footnote{This assumes that standard outputs are added to their corresponding blocks' Merkle trees immediately.}
+\item Ensure that wallet software considers self-directed standard outputs to be confirmed no sooner than three blocks.
+\item Ensure that wallet software considers other standard outputs to be confirmed no sooner than six blocks.
+\item Ensure that wallet software, to the extent feasible, duplicates transaction semantics in the event of a reorganization-induced transaction reissuance.
+\item If deemed safe and feasible, decouple FCMPs from transaction semantics.
+\end{itemize}
+
+We note that these changes decouple standard output lock enforcement from confirmation, but enforce a minimal anchor age to help mitigate fingerprinting and improve user experience.
+This allows senders to more safely handle outputs directed to themselves, since reorganization simply returns the funds.
+
+We also note that this retains risk-based flexibility in transaction acceptance.
+For transactions considered to be of higher risk, like those involving exchanges or higher amounts, recipients can always locally impose more strict confirmation requirements without undue burden on other users or the use of corresponding consensus rules.
+Further, recipients of low-risk transactions may impose less strict confirmation requirements if they deem the associated risks acceptable.
+
+As with the above notes for the current protocol, we caution that a reduction in the lock enforcement period (via the anchor depth) changes economic incentives for malicious block producers.
+Such a reduction therefore increases risk in a manner that is challenging to quantify.
+For this reason, careful ongoing observation of changes in block propagation, known mining distribution, estimated mining hash rate, and reorganization behavior are recommended if this option is implemented. 
+
+\end{document}
